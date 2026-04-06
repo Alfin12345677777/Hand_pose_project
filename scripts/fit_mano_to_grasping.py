@@ -163,9 +163,9 @@ def load_grasping_samples(root_dir):
             kp2d_flat = d['gesture']['hand_gesture_data']['hand_keypoints']['2D']
             kp2d = np.array(kp2d_flat, dtype=np.float32).reshape(21, 2)
 
-            # FreiHAND format: wrist-relative, normalized by wrist→middle DIP (joint 11)
+            # FreiHAND format: wrist-relative, normalized by wrist→middle tip (joint 12)
             kp2d -= kp2d[0:1, :]
-            scale = np.linalg.norm(kp2d[11]) + 1e-6
+            scale = np.linalg.norm(kp2d[12]) + 1e-6
             kp2d /= scale
 
             landmarks_list.append(kp2d.reshape(-1))  # (42,)

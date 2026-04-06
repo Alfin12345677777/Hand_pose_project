@@ -236,29 +236,57 @@ class ShapeDecoder(nn.Module):
 
 
 class PoseEncoder(nn.Module):
-    """Regresses MANO pose parameters from 2D landmarks (same arch as PoseLifter)."""
+    """
+    Regresses MANO pose parameters from 2D landmarks.
+
+    Wider + deeper than original (256→256→128) with residual connections
+    to better handle the 2D→3D ambiguity. The residual blocks help
+    gradients flow through the deeper network without degradation.
+    """
 
     def __init__(self, in_dim=42, out_dim=48, dropout=0.2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 256),
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        # Residual block 1
+        self.res1 = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+        )
+        # Residual block 2
+        self.res2 = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+        )
+        # Output head
+        self.output_head = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(128, out_dim),
+            nn.Linear(256, out_dim),
         )
 
     def forward(self, x):
         """x: (B, 42) landmarks → (B, 48) pose params."""
-        return self.net(x)
+        h = self.input_proj(x)
+        h = F.relu(h + self.res1(h), inplace=True)
+        h = F.relu(h + self.res2(h), inplace=True)
+        return self.output_head(h)
 
 
 class CorrectionNet(nn.Module):
@@ -278,14 +306,18 @@ class CorrectionNet(nn.Module):
         super().__init__()
         self.num_verts = num_verts
         self.fc_pose = nn.Sequential(
-            nn.Linear(pose_dim, 256),
+            nn.Linear(pose_dim, 1024),
             nn.ReLU(inplace=True),
-            nn.Linear(256, num_verts * 3),
+            nn.Linear(1024, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, num_verts * 3),
         )
         self.fc_shape = nn.Sequential(
-            nn.Linear(shape_dim, 256),
+            nn.Linear(shape_dim, 1024),
             nn.ReLU(inplace=True),
-            nn.Linear(256, num_verts * 3),
+            nn.Linear(1024, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, num_verts * 3),
         )
         # Init last layers near zero so corrections start negligible
         nn.init.normal_(self.fc_pose[-1].weight,  std=1e-4)
@@ -1308,8 +1340,14 @@ def main(epochs=EPOCHS, max_batches=None, resume=False):
         pose_lifter_state = torch.load(POSE_LIFTER_PTH, map_location=device)
         if isinstance(pose_lifter_state, dict) and 'model_state_dict' in pose_lifter_state:
             pose_lifter_state = pose_lifter_state['model_state_dict']
-        model.pose_encoder.load_state_dict(pose_lifter_state, strict=True)
-        print('[main] Pose lifter weights loaded (strict=True).')
+        # strict=False: new PoseEncoder has different architecture than old PoseLifter.
+        # Matching layers will be loaded, new layers init randomly.
+        missing, unexpected = model.pose_encoder.load_state_dict(pose_lifter_state, strict=False)
+        if missing:
+            print(f'[main] Pose lifter: {len(missing)} new params (randomly initialized).')
+        if unexpected:
+            print(f'[main] Pose lifter: {len(unexpected)} old params skipped (arch changed).')
+        print('[main] Pose lifter weights loaded (strict=False — new architecture).')
 
     # ------------------------------------------------------------------ #
     # 5b. Freeze/unfreeze pose encoder based on start_epoch

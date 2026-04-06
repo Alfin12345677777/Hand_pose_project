@@ -69,17 +69,32 @@ class LandmarkPoseDataset(Dataset):
 # MODEL
 # ──────────────────────────────────────────
 class PoseLifter(nn.Module):
+    """Wider + deeper with residual connections (matches PoseEncoder in train_unified_model.py)."""
     def __init__(self, in_dim=42, out_dim=48, dropout=DROPOUT):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(256, 256),    nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(256, 128),    nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(128, out_dim)
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
+        )
+        self.res1 = nn.Sequential(
+            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(512, 512), nn.BatchNorm1d(512),
+        )
+        self.res2 = nn.Sequential(
+            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(512, 512), nn.BatchNorm1d(512),
+        )
+        self.output_head = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(256, out_dim),
         )
 
     def forward(self, x):
-        return self.net(x)
+        import torch.nn.functional as F
+        h = self.input_proj(x)
+        h = F.relu(h + self.res1(h))
+        h = F.relu(h + self.res2(h))
+        return self.output_head(h)
 
 
 # ──────────────────────────────────────────

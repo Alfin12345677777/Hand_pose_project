@@ -30,52 +30,90 @@ warnings.filterwarnings('ignore')
 # ──────────────────────────────────────────
 # PATHS
 # ──────────────────────────────────────────
-MODEL_PATH   = '../models/pose_lifter.pth'
-MANO_PKL     = '../models/MANO_RIGHT.pkl'
-MANO_ALIGNED = '../meshes/MANO_ALIGNED_TO_KOREA.obj'
-KMANO_MESH   = '../meshes/AVERAGE_KOREAN_HAND_CENTERED.obj'
-OUTPUT_IMG   = '../outputs/inference_result.png'
+MODEL_PATH     = '../models/pose_lifter.pth'
+MANO_PKL       = '../models/MANO_RIGHT.pkl'
+MANO_ALIGNED   = '../meshes/MANO_ALIGNED_TO_KOREA.obj'
+KMANO_MESH     = '../meshes/AVERAGE_KOREAN_HAND_CENTERED.obj'
+SKELETON_JSON  = '../models/korean_hand_skeleton.json'
+WEIGHTS_NPY    = '../data/mano_transferred_weights.npy'
+OUTPUT_IMG     = '../outputs/inference_result.png'
 
 MIDDLE_TIP_IDX = 12   # MediaPipe / MANO joint index for middle fingertip
+
+_JOINT_NAMES_16 = [
+    'wrist',
+    'index1',  'index2',  'index3',
+    'middle1', 'middle2', 'middle3',
+    'pinky1',  'pinky2',  'pinky3',
+    'ring1',   'ring2',   'ring3',
+    'thumb1',  'thumb2',  'thumb3',
+]
 
 # ──────────────────────────────────────────
 # MODEL (must match train_pose_lifter.py)
 # ──────────────────────────────────────────
 class PoseLifter(nn.Module):
+    """Must match PoseEncoder in train_unified_model.py."""
     def __init__(self, in_dim=42, out_dim=48, dropout=0.2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(256, 256),    nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(256, 128),    nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(128, out_dim)
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
+        )
+        self.res1 = nn.Sequential(
+            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(512, 512), nn.BatchNorm1d(512),
+        )
+        self.res2 = nn.Sequential(
+            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(512, 512), nn.BatchNorm1d(512),
+        )
+        self.output_head = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(256, out_dim),
         )
     def forward(self, x):
-        return self.net(x)
+        h = self.input_proj(x)
+        h = torch.relu(h + self.res1(h))
+        h = torch.relu(h + self.res2(h))
+        return self.output_head(h)
 
 
 # ──────────────────────────────────────────
 # LBS SETUP  (same as generate_posed_meshes)
 # ──────────────────────────────────────────
 def load_lbs():
+    import json
+
     with open(MANO_PKL, 'rb') as f:
         mano = pickle.load(f, encoding='latin1')
 
-    J_reg    = np.array(mano['J_regressor'].todense(), dtype=np.float64)
-    weights  = np.array(mano['weights'],    dtype=np.float64)
     kintree  = np.array(mano['kintree_table'], dtype=np.int64)
     parents  = kintree[0].copy(); parents[0] = -1
 
-    mano_rest  = np.array(trimesh.load(MANO_ALIGNED, process=False).vertices, dtype=np.float64)
+    # Load Korean joint positions (correct scale, on the mesh)
+    with open(SKELETON_JSON) as f:
+        skel = json.load(f)
+    J = np.array([skel[n]['position_mm'] for n in _JOINT_NAMES_16],
+                 dtype=np.float64)  # (16, 3) in mm
+
+    # Load Korean mesh
     kmano_mesh = trimesh.load(KMANO_MESH, process=False)
     kmano_rest = np.array(kmano_mesh.vertices, dtype=np.float64)
     kmano_faces= np.array(kmano_mesh.faces, dtype=np.int32)
 
-    tree = cKDTree(mano_rest)
-    _, kmano_to_mano = tree.query(kmano_rest, workers=-1)
-    weights_kmano = weights[kmano_to_mano]
+    # Load blend weights (from Blender or transfer script)
+    if os.path.exists(WEIGHTS_NPY):
+        weights_kmano = np.load(WEIGHTS_NPY).astype(np.float64)
+    else:
+        # Fallback: KNN transfer from MANO (not ideal but functional)
+        mano_rest = np.array(trimesh.load(MANO_ALIGNED, process=False).vertices, dtype=np.float64)
+        weights   = np.array(mano['weights'], dtype=np.float64)
+        tree = cKDTree(mano_rest)
+        _, kmano_to_mano = tree.query(kmano_rest, workers=-1)
+        weights_kmano = weights[kmano_to_mano]
 
-    return J_reg, weights_kmano, parents, mano_rest, kmano_rest, kmano_faces
+    return J, weights_kmano, parents, kmano_rest, kmano_faces
 
 
 def rodrigues(r):
@@ -86,8 +124,7 @@ def rodrigues(r):
     return np.eye(3) + np.sin(theta)*K + (1-np.cos(theta))*(K@K)
 
 
-def lbs_custom(v_rest, pose_params, J_reg, mano_rest, weights, parents):
-    J  = J_reg @ mano_rest
+def lbs_custom(v_rest, pose_params, J, weights, parents):
     Rs = np.stack([rodrigues(pose_params[j*3:(j+1)*3]) for j in range(16)])
     G  = [None] * 16
     for j in range(16):
@@ -173,11 +210,10 @@ def run_inference(landmarks_2d, image=None):
     print(f"Predicted pose range: [{pose_params.min():.3f}, {pose_params.max():.3f}] rad")
 
     # Load LBS components
-    J_reg, weights_kmano, parents, mano_rest, kmano_rest, kmano_faces = load_lbs()
+    J, weights_kmano, parents, kmano_rest, kmano_faces = load_lbs()
 
     # Apply pose to K-MANO
-    v_posed = lbs_custom(kmano_rest, pose_params, J_reg, mano_rest,
-                         weights_kmano, parents)
+    v_posed = lbs_custom(kmano_rest, pose_params, J, weights_kmano, parents)
 
     # Save mesh
     out_mesh = trimesh.Trimesh(vertices=v_posed, faces=kmano_faces, process=False)
