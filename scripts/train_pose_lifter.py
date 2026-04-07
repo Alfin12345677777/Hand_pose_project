@@ -15,14 +15,20 @@ At inference:
 """
 
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+# Import bone feature extractor from unified model
+sys.path.insert(0, os.path.dirname(__file__))
+from train_unified_model import extract_bone_features
 
 # ──────────────────────────────────────────
 # PATHS
@@ -69,8 +75,8 @@ class LandmarkPoseDataset(Dataset):
 # MODEL
 # ──────────────────────────────────────────
 class PoseLifter(nn.Module):
-    """Wider + deeper with residual connections (matches PoseEncoder in train_unified_model.py)."""
-    def __init__(self, in_dim=42, out_dim=48, dropout=DROPOUT):
+    """Wider + deeper with residual connections + bone length features (matches PoseEncoder)."""
+    def __init__(self, in_dim=52, out_dim=48, dropout=DROPOUT):
         super().__init__()
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
@@ -144,8 +150,10 @@ if __name__ == '__main__':
         train_loss = 0.0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
+            bone_feat = extract_bone_features(xb)  # (B, 10)
+            xb_full = torch.cat([xb, bone_feat], dim=-1)  # (B, 52)
             optimizer.zero_grad()
-            pred = model(xb)
+            pred = model(xb_full)
             loss = criterion(pred, yb)
             loss.backward()
             optimizer.step()
@@ -158,7 +166,9 @@ if __name__ == '__main__':
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
-                val_loss += criterion(model(xb), yb).item() * len(xb)
+                bone_feat = extract_bone_features(xb)
+                xb_full = torch.cat([xb, bone_feat], dim=-1)
+                val_loss += criterion(model(xb_full), yb).item() * len(xb)
         val_loss /= n_val
 
         scheduler.step()

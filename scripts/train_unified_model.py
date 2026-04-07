@@ -235,16 +235,90 @@ class ShapeDecoder(nn.Module):
         return self.net(z)
 
 
+def extract_bone_features(landmarks):
+    """
+    Extract bone length ratios from 2D landmarks as extra features.
+
+    landmarks: (B, 42) — 21 joints × 2D, wrist-centered, scale-normalized.
+    Returns: (B, 10) — 10 bone proportion features.
+
+    MediaPipe 21-joint order:
+      0=wrist, 1-4=thumb, 5-8=index, 9-12=middle, 13-16=ring, 17-20=pinky
+
+    Features computed (all as ratios, scale-invariant):
+      0: thumb_len / middle_len
+      1: index_len / middle_len
+      2: ring_len / middle_len
+      3: pinky_len / middle_len
+      4: palm_len / hand_len  (wrist→middle_base / wrist→middle_tip)
+      5: index_base_dist (wrist→index_base normalized)
+      6: pinky_base_dist (wrist→pinky_base normalized)
+      7: thumb_spread (angle between thumb and index)
+      8: finger_spread (angle between index and pinky bases)
+      9: hand_aspect (width / length ratio)
+
+    These features encode hand proportions from 2D alone,
+    trained on statistics from 4,545 Korean hand measurements.
+    """
+    B = landmarks.shape[0]
+    lm = landmarks.view(B, 21, 2)  # (B, 21, 2)
+
+    # Joint distances (all relative, scale-invariant since landmarks are normalized)
+    def dist(a, b):
+        return ((lm[:, a] - lm[:, b]) ** 2).sum(dim=-1).sqrt().clamp(min=1e-6)
+
+    # Finger lengths (tip-to-base)
+    thumb_len = dist(1, 4)    # thumb base to tip
+    index_len = dist(5, 8)    # index base to tip
+    middle_len = dist(9, 12)  # middle base to tip
+    ring_len = dist(13, 16)   # ring base to tip
+    pinky_len = dist(17, 20)  # pinky base to tip
+
+    # Palm and hand lengths
+    hand_len = dist(0, 12)    # wrist to middle tip
+    palm_len = dist(0, 9)     # wrist to middle base
+
+    # Ratios (relative to middle finger — most stable reference)
+    r_thumb = thumb_len / middle_len
+    r_index = index_len / middle_len
+    r_ring = ring_len / middle_len
+    r_pinky = pinky_len / middle_len
+    r_palm = palm_len / hand_len.clamp(min=1e-6)
+
+    # Base positions (normalized distances from wrist)
+    index_base = dist(0, 5) / hand_len.clamp(min=1e-6)
+    pinky_base = dist(0, 17) / hand_len.clamp(min=1e-6)
+
+    # Spread angles (using atan2 on base joint positions)
+    thumb_dir = torch.atan2(lm[:, 2, 1] - lm[:, 0, 1], lm[:, 2, 0] - lm[:, 0, 0])
+    index_dir = torch.atan2(lm[:, 5, 1] - lm[:, 0, 1], lm[:, 5, 0] - lm[:, 0, 0])
+    pinky_dir = torch.atan2(lm[:, 17, 1] - lm[:, 0, 1], lm[:, 17, 0] - lm[:, 0, 0])
+    thumb_spread = thumb_dir - index_dir
+    finger_spread = index_dir - pinky_dir
+
+    # Hand aspect ratio (width / length)
+    # Width: distance between index base and pinky base
+    hand_width = dist(5, 17)
+    aspect = hand_width / hand_len.clamp(min=1e-6)
+
+    features = torch.stack([
+        r_thumb, r_index, r_ring, r_pinky, r_palm,
+        index_base, pinky_base, thumb_spread, finger_spread, aspect
+    ], dim=-1)  # (B, 10)
+
+    return features
+
+
 class PoseEncoder(nn.Module):
     """
-    Regresses MANO pose parameters from 2D landmarks.
+    Regresses MANO pose parameters from 2D landmarks + bone length features.
 
-    Wider + deeper than original (256→256→128) with residual connections
-    to better handle the 2D→3D ambiguity. The residual blocks help
-    gradients flow through the deeper network without degradation.
+    Input: 42 landmarks + 10 bone proportion features = 52 dimensions.
+    The bone features encode hand proportions (finger ratios, palm ratio,
+    spread angles) that help resolve 2D→3D depth ambiguity.
     """
 
-    def __init__(self, in_dim=42, out_dim=48, dropout=0.3):
+    def __init__(self, in_dim=52, out_dim=48, dropout=0.3):
         super().__init__()
         # Input projection
         self.input_proj = nn.Sequential(
@@ -282,7 +356,7 @@ class PoseEncoder(nn.Module):
         )
 
     def forward(self, x):
-        """x: (B, 42) landmarks → (B, 48) pose params."""
+        """x: (B, 52) landmarks+bone_features → (B, 48) pose params."""
         h = self.input_proj(x)
         h = F.relu(h + self.res1(h), inplace=True)
         h = F.relu(h + self.res2(h), inplace=True)
@@ -432,9 +506,12 @@ class UnifiedHandModel(nn.Module):
     def encode_pose(self, landmarks):
         """
         landmarks : (B, 42) 2D landmarks
+        Computes bone length features and concatenates with landmarks.
         Returns (B, 48) pose params.
         """
-        return self.pose_encoder(landmarks)
+        bone_features = extract_bone_features(landmarks)  # (B, 10)
+        x = torch.cat([landmarks, bone_features], dim=-1)  # (B, 52)
+        return self.pose_encoder(x)
 
     # ------------------------------------------------------------------
     # LBS

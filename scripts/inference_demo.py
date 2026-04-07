@@ -53,8 +53,8 @@ _JOINT_NAMES_16 = [
 # MODEL (must match train_pose_lifter.py)
 # ──────────────────────────────────────────
 class PoseLifter(nn.Module):
-    """Must match PoseEncoder in train_unified_model.py."""
-    def __init__(self, in_dim=42, out_dim=48, dropout=0.2):
+    """Must match PoseEncoder in train_unified_model.py (42 landmarks + 10 bone features = 52)."""
+    def __init__(self, in_dim=52, out_dim=48, dropout=0.2):
         super().__init__()
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
@@ -155,6 +155,43 @@ def normalize_landmarks(landmarks_2d):
     return np.clip(lm.flatten(), -5.0, 5.0)
 
 
+def _extract_bone_features_np(landmarks_flat):
+    """
+    NumPy version of extract_bone_features for inference.
+    landmarks_flat: (42,) normalized 2D landmarks.
+    Returns: (10,) bone proportion features.
+    """
+    lm = landmarks_flat.reshape(21, 2)
+
+    def dist(a, b):
+        return max(np.linalg.norm(lm[a] - lm[b]), 1e-6)
+
+    thumb_len = dist(1, 4)
+    index_len = dist(5, 8)
+    middle_len = dist(9, 12)
+    ring_len = dist(13, 16)
+    pinky_len = dist(17, 20)
+    hand_len = max(dist(0, 12), 1e-6)
+    palm_len = dist(0, 9)
+
+    thumb_dir = np.arctan2(lm[2, 1] - lm[0, 1], lm[2, 0] - lm[0, 0])
+    index_dir = np.arctan2(lm[5, 1] - lm[0, 1], lm[5, 0] - lm[0, 0])
+    pinky_dir = np.arctan2(lm[17, 1] - lm[0, 1], lm[17, 0] - lm[0, 0])
+
+    return np.array([
+        thumb_len / middle_len,
+        index_len / middle_len,
+        ring_len / middle_len,
+        pinky_len / middle_len,
+        palm_len / hand_len,
+        dist(0, 5) / hand_len,
+        dist(0, 17) / hand_len,
+        thumb_dir - index_dir,
+        index_dir - pinky_dir,
+        dist(5, 17) / hand_len,
+    ], dtype=np.float32)
+
+
 # ──────────────────────────────────────────
 # RENDER RESULT
 # ──────────────────────────────────────────
@@ -202,10 +239,13 @@ def run_inference(landmarks_2d, image=None):
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
     model.eval()
 
-    # Normalize + predict
+    # Normalize + extract bone features + predict
     x = normalize_landmarks(landmarks_2d)
+    x_t = torch.tensor(x).unsqueeze(0)  # (1, 42)
+    bone_feat = _extract_bone_features_np(x)  # (10,)
+    x_full = torch.cat([x_t, torch.tensor(bone_feat).unsqueeze(0)], dim=-1)  # (1, 52)
     with torch.no_grad():
-        pose_params = model(torch.tensor(x).unsqueeze(0)).squeeze(0).numpy()
+        pose_params = model(x_full).squeeze(0).numpy()
 
     print(f"Predicted pose range: [{pose_params.min():.3f}, {pose_params.max():.3f}] rad")
 
