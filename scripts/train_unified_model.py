@@ -309,57 +309,159 @@ def extract_bone_features(landmarks):
     return features
 
 
+# ---------------------------------------------------------------------------
+# Semantic Graph Convolution (SemGCN — Zhao et al. 2019)
+# ---------------------------------------------------------------------------
+
+# Hand skeleton adjacency: MediaPipe 21-joint connectivity
+_HAND_EDGES = [
+    (0, 1), (1, 2), (2, 3), (3, 4),       # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),       # index
+    (0, 9), (9, 10), (10, 11), (11, 12),   # middle
+    (0, 13), (13, 14), (14, 15), (15, 16), # ring
+    (0, 17), (17, 18), (18, 19), (19, 20), # pinky
+    (5, 9), (9, 13), (13, 17),             # cross-finger palm connections
+]
+
+
+def _build_hand_adjacency(n_joints=21):
+    """Build symmetric adjacency matrix with self-loops for hand skeleton."""
+    A = torch.zeros(n_joints, n_joints)
+    for i, j in _HAND_EDGES:
+        A[i, j] = 1.0
+        A[j, i] = 1.0
+    # Add self-loops
+    A += torch.eye(n_joints)
+    # Normalize: D^{-1/2} A D^{-1/2}
+    D = A.sum(dim=1)
+    D_inv_sqrt = torch.diag(D.pow(-0.5))
+    A_norm = D_inv_sqrt @ A @ D_inv_sqrt
+    return A_norm
+
+
+class SemGraphConv(nn.Module):
+    """
+    Semantic Graph Convolution layer (Zhao et al. 2019).
+    Learns a weighted adjacency per feature channel.
+    """
+
+    def __init__(self, in_features, out_features, adj, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.W = nn.Parameter(torch.zeros(in_features, out_features))
+        # Learnable adjacency mask (initialized from skeleton topology)
+        self.M = nn.Parameter(adj.clone())
+        if bias:
+            self.b = nn.Parameter(torch.zeros(1, 1, out_features))
+        else:
+            self.b = None
+        nn.init.xavier_uniform_(self.W)
+
+    def forward(self, x):
+        """
+        x: (B, J, in_features)
+        Returns: (B, J, out_features)
+        """
+        # x @ W: per-joint feature transform
+        h = x @ self.W  # (B, J, out_features)
+        # M @ h: aggregate from neighbors (M is learnable adjacency)
+        out = self.M @ h  # (B, J, out_features)
+        if self.b is not None:
+            out = out + self.b
+        return out
+
+
 class PoseEncoder(nn.Module):
     """
-    Regresses MANO pose parameters from 2D landmarks + bone length features.
+    GCN + Late Fusion PoseEncoder.
 
-    Input: 42 landmarks + 10 bone proportion features = 52 dimensions.
-    The bone features encode hand proportions (finger ratios, palm ratio,
-    spread angles) that help resolve 2D→3D depth ambiguity.
+    Graph stream: 2D landmarks (B,21,2) → SemGCN layers → graph features (B,256)
+    Prior stream: bone length ratios (B,10) → pass through
+    Fusion: concat (B,266) → output head → (B,48) pose params
+
+    The GCN handles micro-anatomy (joint connectivity, spatial relationships).
+    The bone ratios handle macro-scale (hand proportions, depth ambiguity).
     """
 
-    def __init__(self, in_dim=52, out_dim=48, dropout=0.3):
+    def __init__(self, in_dim=52, out_dim=48, dropout=0.3, n_joints=21,
+                 gcn_hidden=128, n_bone_features=10):
         super().__init__()
-        # Input projection
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-        )
-        # Residual block 1
-        self.res1 = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
-        )
-        # Residual block 2
-        self.res2 = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
-        )
-        # Output head
-        self.output_head = nn.Sequential(
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 256),
+        self.n_joints = n_joints
+        self.n_bone_features = n_bone_features
+
+        # Build adjacency matrix
+        A = _build_hand_adjacency(n_joints)
+        self.register_buffer('A', A)
+
+        # Graph stream: SemGCN layers
+        self.gcn1 = SemGraphConv(2, gcn_hidden, A)
+        self.gcn2 = SemGraphConv(gcn_hidden, gcn_hidden, A)
+        self.gcn3 = SemGraphConv(gcn_hidden, gcn_hidden, A)
+        self.gcn_bn1 = nn.BatchNorm1d(n_joints)
+        self.gcn_bn2 = nn.BatchNorm1d(n_joints)
+        self.gcn_bn3 = nn.BatchNorm1d(n_joints)
+        self.gcn_drop = nn.Dropout(dropout)
+
+        # Flatten GCN output: (B, 21*gcn_hidden) → (B, 256)
+        self.gcn_proj = nn.Sequential(
+            nn.Linear(n_joints * gcn_hidden, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
+        )
+
+        # Fusion: 256 (graph) + 10 (bone ratios) = 266
+        fusion_dim = 256 + n_bone_features
+
+        # Output head with residual block
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(fusion_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        self.res_block = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+        )
+        self.output_head = nn.Sequential(
+            nn.ReLU(inplace=True),
             nn.Linear(256, out_dim),
         )
 
     def forward(self, x):
-        """x: (B, 52) landmarks+bone_features → (B, 48) pose params."""
-        h = self.input_proj(x)
-        h = F.relu(h + self.res1(h), inplace=True)
-        h = F.relu(h + self.res2(h), inplace=True)
+        """
+        x: (B, 52) — first 42 = landmarks, last 10 = bone features.
+        Returns: (B, 48) pose params.
+        """
+        landmarks = x[:, :self.n_joints * 2]    # (B, 42)
+        bone_feat = x[:, self.n_joints * 2:]     # (B, 10)
+
+        # ── Graph stream ──
+        B = landmarks.shape[0]
+        joints = landmarks.view(B, self.n_joints, 2)  # (B, 21, 2)
+
+        # SemGCN layers with residual connections
+        h = F.relu(self.gcn_bn1(self.gcn1(joints)))
+        h = self.gcn_drop(h)
+        h = F.relu(self.gcn_bn2(self.gcn2(h)) + h)  # residual
+        h = self.gcn_drop(h)
+        h = F.relu(self.gcn_bn3(self.gcn3(h)) + h)  # residual
+
+        # Flatten: (B, 21, 128) → (B, 21*128) → (B, 256)
+        graph_feat = self.gcn_proj(h.view(B, -1))
+
+        # ── Fusion ──
+        fused = torch.cat([graph_feat, bone_feat], dim=-1)  # (B, 266)
+
+        # ── Output with residual ──
+        h = self.fusion_proj(fused)
+        h = F.relu(h + self.res_block(h), inplace=True)
         return self.output_head(h)
 
 

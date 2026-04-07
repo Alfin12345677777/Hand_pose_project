@@ -75,31 +75,51 @@ class LandmarkPoseDataset(Dataset):
 # MODEL
 # ──────────────────────────────────────────
 class PoseLifter(nn.Module):
-    """Wider + deeper with residual connections + bone length features (matches PoseEncoder)."""
-    def __init__(self, in_dim=52, out_dim=48, dropout=DROPOUT):
+    """GCN + Late Fusion (matches PoseEncoder in train_unified_model.py)."""
+    def __init__(self, in_dim=52, out_dim=48, dropout=DROPOUT, n_joints=21,
+                 gcn_hidden=128, n_bone_features=10):
         super().__init__()
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
+        from train_unified_model import SemGraphConv, _build_hand_adjacency
+        self.n_joints = n_joints
+        self.n_bone_features = n_bone_features
+        A = _build_hand_adjacency(n_joints)
+        self.register_buffer('A', A)
+        self.gcn1 = SemGraphConv(2, gcn_hidden, A)
+        self.gcn2 = SemGraphConv(gcn_hidden, gcn_hidden, A)
+        self.gcn3 = SemGraphConv(gcn_hidden, gcn_hidden, A)
+        self.gcn_bn1 = nn.BatchNorm1d(n_joints)
+        self.gcn_bn2 = nn.BatchNorm1d(n_joints)
+        self.gcn_bn3 = nn.BatchNorm1d(n_joints)
+        self.gcn_drop = nn.Dropout(dropout)
+        self.gcn_proj = nn.Sequential(
+            nn.Linear(n_joints * gcn_hidden, 256),
+            nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
         )
-        self.res1 = nn.Sequential(
-            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(512, 512), nn.BatchNorm1d(512),
+        fusion_dim = 256 + n_bone_features
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(fusion_dim, 256),
+            nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
         )
-        self.res2 = nn.Sequential(
-            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(512, 512), nn.BatchNorm1d(512),
+        self.res_block = nn.Sequential(
+            nn.Linear(256, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(256, 256), nn.BatchNorm1d(256),
         )
-        self.output_head = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(256, out_dim),
-        )
+        self.output_head = nn.Sequential(nn.ReLU(), nn.Linear(256, out_dim))
 
     def forward(self, x):
-        import torch.nn.functional as F
-        h = self.input_proj(x)
-        h = F.relu(h + self.res1(h))
-        h = F.relu(h + self.res2(h))
+        landmarks = x[:, :self.n_joints * 2]
+        bone_feat = x[:, self.n_joints * 2:]
+        B = landmarks.shape[0]
+        joints = landmarks.view(B, self.n_joints, 2)
+        h = F.relu(self.gcn_bn1(self.gcn1(joints)))
+        h = self.gcn_drop(h)
+        h = F.relu(self.gcn_bn2(self.gcn2(h)) + h)
+        h = self.gcn_drop(h)
+        h = F.relu(self.gcn_bn3(self.gcn3(h)) + h)
+        graph_feat = self.gcn_proj(h.view(B, -1))
+        fused = torch.cat([graph_feat, bone_feat], dim=-1)
+        h = self.fusion_proj(fused)
+        h = F.relu(h + self.res_block(h))
         return self.output_head(h)
 
 

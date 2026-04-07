@@ -52,30 +52,69 @@ _JOINT_NAMES_16 = [
 # ──────────────────────────────────────────
 # MODEL (must match train_pose_lifter.py)
 # ──────────────────────────────────────────
-class PoseLifter(nn.Module):
-    """Must match PoseEncoder in train_unified_model.py (42 landmarks + 10 bone features = 52)."""
-    def __init__(self, in_dim=52, out_dim=48, dropout=0.2):
+class _SemGraphConv(nn.Module):
+    """Semantic Graph Convolution (matches train_unified_model.py)."""
+    def __init__(self, in_features, out_features, adj, bias=True):
         super().__init__()
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
-        )
-        self.res1 = nn.Sequential(
-            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(512, 512), nn.BatchNorm1d(512),
-        )
-        self.res2 = nn.Sequential(
-            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(512, 512), nn.BatchNorm1d(512),
-        )
-        self.output_head = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(256, out_dim),
-        )
+        self.W = nn.Parameter(torch.zeros(in_features, out_features))
+        self.M = nn.Parameter(adj.clone())
+        self.b = nn.Parameter(torch.zeros(1, 1, out_features)) if bias else None
+        nn.init.xavier_uniform_(self.W)
     def forward(self, x):
-        h = self.input_proj(x)
-        h = torch.relu(h + self.res1(h))
-        h = torch.relu(h + self.res2(h))
+        h = x @ self.W
+        out = self.M @ h
+        return out + self.b if self.b is not None else out
+
+def _build_hand_adj(n=21):
+    edges = [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
+             (0,9),(9,10),(10,11),(11,12),(0,13),(13,14),(14,15),(15,16),
+             (0,17),(17,18),(18,19),(19,20),(5,9),(9,13),(13,17)]
+    A = torch.zeros(n, n)
+    for i, j in edges: A[i,j] = A[j,i] = 1.0
+    A += torch.eye(n)
+    D = A.sum(1).pow(-0.5).diag()
+    return D @ A @ D
+
+class PoseLifter(nn.Module):
+    """GCN + Late Fusion (matches PoseEncoder in train_unified_model.py)."""
+    def __init__(self, in_dim=52, out_dim=48, dropout=0.2, n_joints=21,
+                 gcn_hidden=128, n_bone_features=10):
+        super().__init__()
+        self.n_joints = n_joints
+        self.n_bone_features = n_bone_features
+        A = _build_hand_adj(n_joints)
+        self.register_buffer('A', A)
+        self.gcn1 = _SemGraphConv(2, gcn_hidden, A)
+        self.gcn2 = _SemGraphConv(gcn_hidden, gcn_hidden, A)
+        self.gcn3 = _SemGraphConv(gcn_hidden, gcn_hidden, A)
+        self.gcn_bn1 = nn.BatchNorm1d(n_joints)
+        self.gcn_bn2 = nn.BatchNorm1d(n_joints)
+        self.gcn_bn3 = nn.BatchNorm1d(n_joints)
+        self.gcn_drop = nn.Dropout(dropout)
+        self.gcn_proj = nn.Sequential(
+            nn.Linear(n_joints * gcn_hidden, 256),
+            nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout))
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(256 + n_bone_features, 256),
+            nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout))
+        self.res_block = nn.Sequential(
+            nn.Linear(256, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(256, 256), nn.BatchNorm1d(256))
+        self.output_head = nn.Sequential(nn.ReLU(), nn.Linear(256, out_dim))
+    def forward(self, x):
+        landmarks = x[:, :self.n_joints * 2]
+        bone_feat = x[:, self.n_joints * 2:]
+        B = landmarks.shape[0]
+        joints = landmarks.view(B, self.n_joints, 2)
+        h = torch.relu(self.gcn_bn1(self.gcn1(joints)))
+        h = self.gcn_drop(h)
+        h = torch.relu(self.gcn_bn2(self.gcn2(h)) + h)
+        h = self.gcn_drop(h)
+        h = torch.relu(self.gcn_bn3(self.gcn3(h)) + h)
+        graph_feat = self.gcn_proj(h.view(B, -1))
+        fused = torch.cat([graph_feat, bone_feat], dim=-1)
+        h = self.fusion_proj(fused)
+        h = torch.relu(h + self.res_block(h))
         return self.output_head(h)
 
 
