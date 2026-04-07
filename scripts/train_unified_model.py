@@ -87,13 +87,13 @@ LAMBDA_CROSS     = 0.3    # supplementary vertex signal; kept < LAMBDA_POSE to a
 LAMBDA_JOINT     = 0.1    # increased: joint signal now supported by L_cross so can raise weight
 LAMBDA_LAP       = 0.01
 LAMBDA_PENET     = 0.005  # penetration loss; small so it doesn't dominate early training
-LAMBDA_CORR      = 0.005  # raised from 0.0001 — CorrectionNet grew L_corr to 0.58 unchecked
+LAMBDA_CORR      = 0.05   # raised for scaled-up CorrectionNet (1024 hidden) — prevent correction explosion
 LAMBDA_CROSS_CORR= 0.3    # vertex loss through corrected mesh — gives CorrectionNet real signal
 LAMBDA_REPROJ    = 0.3    # 2D reprojection loss on grasping dataset; balanced with L_cross
 LAMBDA_TIP       = 0.1    # fingertip position loss; same scale as LAMBDA_JOINT
 LAMBDA_EGO_MESH  = 0.1    # reduced from 0.5 — 134 frames too small to dominate training
-LM_SCALE_JITTER  = 0.05   # landmark scale jitter ±5%; pose params are scale-invariant
-LM_NOISE_STD     = 0.01   # landmark Gaussian noise std; ~1% of hand size
+LM_SCALE_JITTER  = 0.10   # landmark scale jitter ±10%; increased to reduce overfitting
+LM_NOISE_STD     = 0.02   # landmark Gaussian noise std; ~2% of hand size
 SCHED_T_MAX      = 400    # 2× epochs so LR never fully collapses within a 200-epoch run
 LR_POSE_UNFREEZE = 1e-5   # lower LR for pose encoder + correction net when unfreezing
 BETA_MAX         = 1e-3
@@ -244,7 +244,7 @@ class PoseEncoder(nn.Module):
     gradients flow through the deeper network without degradation.
     """
 
-    def __init__(self, in_dim=42, out_dim=48, dropout=0.2):
+    def __init__(self, in_dim=42, out_dim=48, dropout=0.3):
         super().__init__()
         # Input projection
         self.input_proj = nn.Sequential(
