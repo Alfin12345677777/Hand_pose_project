@@ -85,22 +85,22 @@ LAMBDA_SHAPE     = 1.0
 LAMBDA_POSE      = 1.0
 LAMBDA_CROSS     = 0.3    # supplementary vertex signal; kept < LAMBDA_POSE to avoid gradient conflict
 LAMBDA_JOINT     = 0.1    # increased: joint signal now supported by L_cross so can raise weight
-LAMBDA_LAP       = 0.01
+LAMBDA_LAP       = 0.1    # raised 10× — Laplacian now scale-normalized so needs higher weight
 LAMBDA_PENET     = 0.005  # penetration loss; small so it doesn't dominate early training
 LAMBDA_CORR      = 0.05   # raised for scaled-up CorrectionNet (1024 hidden) — prevent correction explosion
 LAMBDA_CROSS_CORR= 0.3    # vertex loss through corrected mesh — gives CorrectionNet real signal
 LAMBDA_REPROJ    = 0.3    # 2D reprojection loss on grasping dataset; balanced with L_cross
 LAMBDA_TIP       = 0.1    # fingertip position loss; same scale as LAMBDA_JOINT
 LAMBDA_EGO_MESH  = 0.1    # reduced from 0.5 — 134 frames too small to dominate training
-LM_SCALE_JITTER  = 0.10   # landmark scale jitter ±10%; increased to reduce overfitting
-LM_NOISE_STD     = 0.02   # landmark Gaussian noise std; ~2% of hand size
+LM_SCALE_JITTER  = 0.15   # landmark scale jitter ±15%; aggressive to reduce overfitting
+LM_NOISE_STD     = 0.03   # landmark Gaussian noise std; ~3% of hand size
 SCHED_T_MAX      = 400    # 2× epochs so LR never fully collapses within a 200-epoch run
 LR_POSE_UNFREEZE = 1e-5   # lower LR for pose encoder + correction net when unfreezing
 BETA_MAX         = 1e-3
 KLD_WARMUP_START = 10
 KLD_WARMUP_END   = 40
 CROSS_START      = 0      # active from epoch 0: no reason to delay dense vertex supervision
-POSE_UNFREEZE    = 10     # unfreeze pose encoder at epoch 10 for quick test
+POSE_UNFREEZE    = 30     # unfreeze at epoch 30 — let shape VAE stabilize first
 
 # ---------------------------------------------------------------------------
 # Rodrigues rotation (batch)
@@ -319,10 +319,11 @@ class CorrectionNet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(1024, num_verts * 3),
         )
-        # Init last layers near zero so corrections start negligible
-        nn.init.normal_(self.fc_pose[-1].weight,  std=1e-4)
+        # Init last layers near zero — use 1e-6 for the larger 1024-unit network
+        # to prevent correction explosion in early epochs
+        nn.init.normal_(self.fc_pose[-1].weight,  std=1e-6)
         nn.init.zeros_(self.fc_pose[-1].bias)
-        nn.init.normal_(self.fc_shape[-1].weight, std=1e-4)
+        nn.init.normal_(self.fc_shape[-1].weight, std=1e-6)
         nn.init.zeros_(self.fc_shape[-1].bias)
 
     def forward(self, pose_params, z_shape):
@@ -330,10 +331,14 @@ class CorrectionNet(nn.Module):
         pose_params : (B, 48)
         z_shape     : (B, 64)
         Returns pose_corr (B, V, 3) and shape_corr (B, V, 3) in dm.
+        Corrections clamped to ±0.05 dm (±5mm) to prevent explosion.
         """
         B = pose_params.shape[0]
         pose_corr  = self.fc_pose(pose_params).view(B, self.num_verts, 3)
         shape_corr = self.fc_shape(z_shape).view(B, self.num_verts, 3)
+        # Clamp to prevent unbounded corrections
+        pose_corr  = torch.clamp(pose_corr,  -0.05, 0.05)
+        shape_corr = torch.clamp(shape_corr, -0.05, 0.05)
         return pose_corr, shape_corr
 
 
@@ -678,21 +683,6 @@ def setup_lbs_data():
     parents_list = [int(kintree[0, j]) for j in range(16)]
     parents_list[0] = -1
 
-    # ── Korean joint positions (correct scale) ──────────────────────────────
-    print('[LBS] Loading Korean joint positions from korean_hand_skeleton.json ...')
-    with open(KOREAN_SKELETON_JSON) as f:
-        skel = json.load(f)
-    J_np = np.array([skel[n]['position_mm'] for n in _JOINT_NAMES_16],
-                    dtype=np.float32)   # (16, 3)
-
-    # ── Diagnostic: Procrustes MANO → Korean to confirm scale ───────────────
-    J_reg    = np.array(mano['J_regressor'].todense(), dtype=np.float32)
-    mano_mesh = trimesh.load(MANO_ALIGNED, process=False)
-    mano_rest = np.array(mano_mesh.vertices, dtype=np.float32)
-    J_mano    = J_reg @ mano_rest          # (16, 3) in MANO ±47 mm space
-    scale_diag, _, _ = _procrustes_umeyama(J_mano, J_np)
-    print(f'[LBS] Procrustes scale MANO → Korean: {scale_diag:.3f}×  (expected ~2.2)')
-
     # ── Korean template vertices ─────────────────────────────────────────────
     print('[LBS] Loading Korean template mesh ...')
     kmesh      = trimesh.load(KOREAN_TEMPLATE, process=False)
@@ -703,6 +693,27 @@ def setup_lbs_data():
     weights_kmano = np.load(MANO_WEIGHTS_NPY).astype(np.float32)  # (11279, 16)
     assert weights_kmano.shape == (NUM_VERTS, 16), \
         f'Expected ({NUM_VERTS}, 16), got {weights_kmano.shape}'
+
+    # ── Compute joint positions from blend weights ───────────────────────────
+    # Instead of loading from korean_hand_skeleton.json (Blender bone positions
+    # that may not match the weight distribution), compute J as the weighted
+    # centroid of vertices per joint. This guarantees J is where the weights
+    # say each joint's center of influence is.
+    print('[LBS] Computing joint positions from blend weight centroids ...')
+    J_np = np.zeros((16, 3), dtype=np.float32)
+    for j in range(16):
+        w_j = weights_kmano[:, j]  # (V,) weight of this joint
+        if w_j.sum() > 1e-6:
+            J_np[j] = (w_j[:, None] * kmano_rest).sum(axis=0) / w_j.sum()
+        else:
+            # Fallback to JSON if joint has no weight
+            with open(KOREAN_SKELETON_JSON) as f:
+                skel = json.load(f)
+            J_np[j] = np.array(skel[_JOINT_NAMES_16[j]]['position_mm'],
+                               dtype=np.float32)
+    print(f'[LBS] Weight-derived joint positions:')
+    for j, name in enumerate(_JOINT_NAMES_16):
+        print(f'  J{j:02d} {name:<12}: [{J_np[j,0]:+7.1f}, {J_np[j,1]:+7.1f}, {J_np[j,2]:+7.1f}]')
 
     dominant = weights_kmano.argmax(axis=1)
     hard = (weights_kmano.max(axis=1) > 0.95).sum()
@@ -1463,9 +1474,9 @@ def main(epochs=EPOCHS, max_batches=None, resume=False):
     base_params = [p for p in model.parameters() if id(p) not in pose_corr_ids]
     pose_corr_params = list(model.pose_encoder.parameters()) + \
                        list(model.correction_net.parameters())
-    optimizer = torch.optim.Adam([
-        {'params': base_params,       'lr': LR},
-        {'params': pose_corr_params,  'lr': LR_POSE_UNFREEZE},
+    optimizer = torch.optim.AdamW([
+        {'params': base_params,       'lr': LR,               'weight_decay': 1e-5},
+        {'params': pose_corr_params,  'lr': LR_POSE_UNFREEZE, 'weight_decay': 1e-4},
     ])
     if resume and os.path.exists(OUTPUT_MODEL):
         ckpt_opt = torch.load(OUTPUT_MODEL, map_location=device)

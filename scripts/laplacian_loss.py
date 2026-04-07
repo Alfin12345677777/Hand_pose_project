@@ -90,8 +90,13 @@ class LaplacianLoss(nn.Module):
             for b in range(B)
         ])                                             # (B, V, 3)
 
+        # Normalize by mesh scale so loss is meaningful at any unit scale.
+        # Without this, dm-scale vertices (~±1.5) produce tiny Lv → loss ≈ 0.
+        scale = vertices.detach().abs().mean().clamp(min=0.01)
+        Lv_norm = Lv / scale
+
         # Mean squared norm across all vertices and batch
-        return (Lv ** 2).sum(dim=-1).mean()
+        return (Lv_norm ** 2).sum(dim=-1).mean()
 
 
 def build_from_mesh_file(mesh_path):
